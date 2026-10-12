@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Echo Blade — доступна гра на звуку та русі</title>
+<style>
+:root{color-scheme:dark;--bg:#020617;--card:#0f172a;--line:#1e293b;--txt:#e2e8f0;--mut:#94a3b8;--cy:#22d3ee;--am:#f59e0b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);font:17px/1.5 system-ui,-apple-system,sans-serif}
+main{max-width:720px;margin:0 auto;padding:16px;display:grid;gap:16px}
+h1{font-size:1.5rem;margin:0}h2{font-size:1.05rem;margin:0 0 8px}
+section,.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
+.top{display:grid;gap:8px}
+button{font:inherit;min-height:52px;padding:10px 16px;border-radius:12px;border:1px solid #334155;background:var(--line);color:var(--txt)}
+button:active{background:#0e7490}
+button:focus-visible{outline:3px solid var(--cy);outline-offset:2px}
+.primary{background:#06b6d4;color:var(--bg);font-weight:700;border-color:#06b6d4}
+.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap}
+[hidden]{display:none!important}
+ul{padding-left:20px;margin:0}li{margin-bottom:6px}
+</style>
+</head>
+<body>
+<div id="aria-assertive" class="sr-only" aria-live="assertive" aria-atomic="true"></div>
+<div id="aria-polite" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+<audio id="silent" loop playsinline aria-hidden="true" src="data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA"></audio>
+
+<main>
+<nav class="top" aria-label="Керування грою">
+  <button id="btn-start" class="primary" onclick="startGame()">Почати бій</button>
+  <button id="btn-motion" onclick="requestMotion()">Увімкнути датчик руху</button>
+  <button id="btn-calib" onclick="calibrate()">Калібрування</button>
+  <button id="btn-hints" onclick="toggleHints()" aria-pressed="false">Голосові підказки: вимкнено</button>
+</nav>
+
+<section aria-labelledby="h-guide">
+  <h2 id="h-guide">Як грати</h2>
+  <ul>
+    <li>Одягніть навушники. Кроки ворога лунають зліва, по центру або справа; що ближче ворог, то гучніші й частіші кроки.</li>
+    <li>Високий короткий сигнал означає, що ворог близько і можна бити. Різко змахніть телефоном у бік ворога: ліворуч, праворуч або вперед.</li>
+    <li>Низький гучний сигнал означає, що ворог б'є. Устигніть влучити по ньому, інакше втратите 20 HP.</li>
+    <li>Кожен подоланий ворог повертає 10 HP (максимум 100).</li>
+    <li>Рівень 1: протримайтеся 3 хвилини. Рівень 2: вороги рухаються з різною швидкістю, теж 3 хвилини.</li>
+    <li>Перед грою ввімкніть датчик руху та пройдіть калібрування. Також вимкніть беззвучний режим.</li>
+  </ul>
+</section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const NAMES = {'-1':'зліва','0':'по центру','1':'справа'};
+const SWING = 11;                 // поріг лінійного прискорення, м/с²
+const LEVEL_TIME = 180;           // тривалість рівня, с
+const HP_MAX = 100, HP_LOSS = 20, HP_GAIN = 10;
+const needsPerm = typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function';
+
+let audioCtx = null, active = false, raf = 0, last = 0, pending = 0;
+let score = 0, hp = HP_MAX, level = 1, levelTime = 0;
+let hints = false;                // голосові підказки: за замовчуванням вимкнені
+let motionOn = false, calib = false, calTimer = 0, dirSign = 1, lastSwing = 0;
+const E = {pos:0, dist:100, speed:26, attacking:false, atkAt:0, nextStep:0, cued:false};
+
+/* force = true — важливе повідомлення, яке озвучується навіть при вимкнених підказках */
+function announce(text, assertive, force) {
+  if (!hints && !force) return;
+  const r = $(assertive ? 'aria-assertive' : 'aria-polite');
+  r.textContent = '';
+  setTimeout(() => { r.textContent = text; }, 50);
+}
+function toggleHints() {
+  hints = !hints;
+  $('btn-hints').textContent = 'Голосові підказки: ' + (hints ? 'увімкнено' : 'вимкнено');
+  $('btn-hints').setAttribute('aria-pressed', hints);
+  announce(hints ? 'Голосові підказки увімкнено' : 'Голосові підказки вимкнено', true, true);
+}
+
+/* ---------- Аудіо ---------- */
+function initAudio() {
+  if (!audioCtx) {
+    const C = window.AudioContext || window.webkitAudioContext;
+    if (C) audioCtx = new C();
+    // iOS: щоб звук грав навіть при беззвучному режимі
+    try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
+    const a = $('silent'); if (a.play) a.play().catch(() => {});
+  }
+  if (audioCtx && audioCtx.state !== 'running') audioCtx.resume();
+}
+function tone(f0, f1, dur, vol, type, pan, delay) {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime + (delay || 0);
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  o.type = type || 'sine';
+  o.frequency.setValueAtTime(f0, t);
+  o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  if (audioCtx.createStereoPanner) {
+    const p = audioCtx.createStereoPanner();
+    p.pan.value = pan || 0;
+    o.connect(p); p.connect(g);
+  } else o.connect(g);
+  g.connect(audioCtx.destination);
+  o.start(t); o.stop(t + dur);
+}
+function swoosh() {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime, n = (audioCtx.sampleRate * 0.2) | 0;
+  const b = audioCtx.createBuffer(1, n, audioCtx.sampleRate), d = b.getChannelData(0);
+  for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
+  const s = audioCtx.createBufferSource(), f = audioCtx.createBiquadFilter(), g = audioCtx.createGain();
+  f.type = 'bandpass';
+  f.frequency.setValueAtTime(400, t); f.frequency.exponentialRampToValueAtTime(1800, t + 0.15);
+  g.gain.setValueAtTime(0.6, t); g.gain.exponentialRampToValueAtTime(0.01, t + 0.2);
+  s.buffer = b; s.connect(f); f.connect(g); g.connect(audioCtx.destination);
+  s.start(t); s.stop(t + 0.2);
+}
+function step(pos, dist, delay) {   // крок ворога: що ближче, то вищий і гучніший
+  const c = 1 - dist / 100, f = 140 + c * 220;
+  tone(f, f * 0.6, 0.14, 0.15 + 0.75 * c, 'triangle', pos, delay);
+}
+const hitSound = () => tone(150, 40, 0.25, 0.8, 'triangle');
+// Старт рівня: 1 сигнал — рівень 1, 2 сигнали — рівень 2
+const levelStartSound = n => { for (let i = 0; i < n; i++) tone(880, 880, 0.14, 0.4, 'sine', 0, i * 0.25); };
+// Перемога: висхідна мелодія (на рівні 2 — довша, фінальна)
+function winSound(big) {
+  const notes = big ? [523, 659, 784, 1047, 784, 1047, 1319, 1568] : [523, 659, 784, 1047];
+  notes.forEach((f, i) => tone(f, f, big && i === notes.length - 1 ? 0.9 : 0.4, 0.4, 'sine', 0, i * 0.2));
+}
+// Програш: низхідна похмура мелодія
+function loseSound() {
+  [400, 320, 250, 160].forEach((f, i) => tone(f, f * 0.8, 0.55, 0.4, 'sawtooth', 0, i * 0.35));
+}
+
+/* ---------- Датчики руху ---------- */
+function requestMotion() {
+  if (!window.DeviceMotionEvent) { setMotionUI('Недоступний', 'Датчик руху недоступний'); announce('Датчик руху недоступний на цьому пристрої.', true, true); return Promise.resolve(); }
+  if (!needsPerm) { enableMotion(); announce('Датчик руху увімкнено.', true, true); return Promise.resolve(); }
+  return DeviceMotionEvent.requestPermission().then(r => {
+    if (r === 'granted') { enableMotion(); announce('Датчик руху увімкнено.', true, true); }
+    else { setMotionUI('Відхилено', 'Увімкнути датчик руху'); announce('Дозвіл відхилено. Натисніть кнопку ще раз і дозвольте доступ.', true, true); }
+  }).catch(() => announce('Не вдалося увімкнути датчик руху. Потрібен HTTPS.', true, true));
+}
+function setMotionUI(stat, btn) {
+  $('btn-motion').textContent = btn;
+}
+function enableMotion() {
+  if (motionOn) return;
+  window.addEventListener('devicemotion', onMotion);
+  motionOn = true;
+  setMotionUI('Активний', 'Датчик руху: увімкнено');
+}
+function onMotion(e) {
+  if (!active && !calib) return;
+  const now = Date.now();
+  if (now - lastSwing < 450) return;
+  const a = e.acceleration;
+  if (!a || a.x === null) return;
+  const m = Math.hypot(a.x, a.y, a.z);
+  if (m < SWING) return;
+  lastSwing = now;
+  const horizontal = Math.abs(a.x) > 0.6 * m;
+  if (calib) {
+    if (!horizontal) { announce('Змах не вбік. Змахніть праворуч.', false, true); return; }
+    dirSign = a.x > 0 ? 1 : -1;
+    calib = false; swoosh();
+    announce('Праворуч визначено. Калібрування завершено.', true, true);
+    return;
+  }
+  attack(!horizontal ? 'center' : (a.x * dirSign > 0 ? 'right' : 'left'));
+}
+function calibrate() {
+  if (active) { announce('Спершу завершіть бій.', true, true); return; }
+  clearTimeout(pending);
+  initAudio(); clearTimeout(calTimer); calib = false;
+  [[-1, 'зліва'], [0, 'по центру'], [1, 'справа']].forEach(([p, n], i) => {
+    setTimeout(() => { announce('Звук ' + n, false, true); for (let k = 0; k < 3; k++) step(p, 60, k * 0.3); }, 300 + i * 2000);
+  });
+  calTimer = setTimeout(() => {
+    if (!motionOn) { announce('Датчик руху не активний. Спершу натисніть «Увімкнути датчик руху». Тест звуку завершено.', true, true); return; }
+    calib = true;
+    announce('Тепер різко змахніть телефоном праворуч, як мечем.', true, true);
+    calTimer = setTimeout(() => {
+      if (calib) { calib = false; announce('Змаху не виявлено. Спробуйте калібрування ще раз.', true, true); }
+    }, 15000);
+  }, 6300);
+}
+
+/* ---------- Бій ---------- */
+function attack(dir) {
+  initAudio(); swoosh();
+  const n = dir === 'left' ? -1 : dir === 'right' ? 1 : 0;
+  const t = {left:'ліворуч', center:'по центру', right:'праворуч'}[dir];
+  if (active && E.dist <= 40 && n === E.pos) {
+    hitSound(); score += 100;
+    hp = Math.min(HP_MAX, hp + HP_GAIN);
+    announce('Влучання! Ворога знищено. Здоров\'я ' + hp, true);
+    spawn();
+    return;
+  }
+  announce('Змах ' + t);
+}
+function spawn(silent) {
+  E.pos = [-1, 0, 1][(Math.random() * 3) | 0];
+  E.dist = 100;
+  // Рівень 1: стала швидкість. Рівень 2: у кожного ворога своя швидкість.
+  E.speed = level === 1 ? 26 : 18 + Math.random() * 24;
+  E.attacking = false; E.cued = false;
+  E.nextStep = performance.now() + 300;
+  if (!silent) announce('Новий ворог ' + NAMES[E.pos] + '!');
+}
+function hurt() {
+  hp -= HP_LOSS; hitSound();
+  if (hp <= 0) { gameOver(); return; }
+  announce('Вас поранено! Залишилось ' + hp + ' HP', true);
+  spawn();
+}
+function loop(now) {
+  if (!active) return;
+  const dt = Math.min(0.1, (now - last) / 1000);
+  last = now;
+  levelTime += dt;
+  if (levelTime >= LEVEL_TIME) { levelWin(); return; }
+  E.dist = Math.max(0, E.dist - E.speed * dt);
+  if (now >= E.nextStep) { step(E.pos, E.dist); E.nextStep = now + 250 + 650 * E.dist / 100; }
+  if (!E.cued && E.dist <= 40) { E.cued = true; tone(1400, 1400, 0.12, 0.35, 'sine', E.pos); }
+  if (!E.attacking && E.dist <= 15) {
+    E.attacking = true; E.atkAt = now;
+    tone(500, 120, 0.35, 0.7, 'sawtooth', E.pos);
+    announce('Ворог б\'є ' + NAMES[E.pos] + '!', true);
+  }
+  if (E.attacking && now - E.atkAt > 600) hurt();
+  if (active) raf = requestAnimationFrame(loop);
+}
+function beginLevel(n) {
+  level = n; levelTime = 0; hp = HP_MAX;
+  active = true;
+  spawn(true);
+  levelStartSound(n);
+  E.nextStep = performance.now() + 900;   // пауза, поки лунає сигнал старту
+  announce('Рівень ' + n + '. ' + (n === 2 ? 'Вороги наближаються з різною швидкістю. ' : '') +
+           'Перший ворог ' + NAMES[E.pos] + '.', true);
+  last = performance.now();
+  cancelAnimationFrame(raf);
+  raf = requestAnimationFrame(loop);
+}
+function startGame() {
+  initAudio();
+  if (needsPerm && !motionOn) requestMotion();
+  clearTimeout(pending); clearTimeout(calTimer); cancelAnimationFrame(raf);
+  calib = false; score = 0;
+  $('btn-start').textContent = 'Перезапустити бій';
+  beginLevel(1);
+}
+function levelWin() {
+  active = false; cancelAnimationFrame(raf);
+  if (level === 1) {
+    winSound(false);
+    announce('Рівень 1 пройдено! Скоро рівень 2.', true);
+    pending = setTimeout(() => beginLevel(2), 4500);
+  } else {
+    winSound(true);
+    announce('Перемога! Гру пройдено. Рахунок: ' + score + '. Натисніть «Почати бій», щоб зіграти знову.', true);
+    level = 1; levelTime = 0; hp = HP_MAX;   // скидання на перший рівень
+    $('btn-start').textContent = 'Почати бій';
+  }
+}
+function gameOver() {
+  active = false; cancelAnimationFrame(raf);
+  loseSound();
+  $('btn-start').textContent = 'Почати знову';
+  announce('Гру закінчено. Рахунок: ' + score + '. Натисніть «Почати знову».', true);
+}
+/* ---------- Старт ---------- */
+window.addEventListener('load', () => {
+  if (!needsPerm) {
+    if (window.DeviceMotionEvent) enableMotion();
+    else setMotionUI('', 'Датчик руху недоступний');
+  }
+});
+</script>
+</body>
+</html>
